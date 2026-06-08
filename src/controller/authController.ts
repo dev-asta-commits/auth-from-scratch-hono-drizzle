@@ -8,8 +8,7 @@ import { generateAuthToken } from "@/utils/jwt";
 import { deleteCookie, getCookie } from "hono/cookie";
 import { sendOtp } from "@/utils/nodemailer";
 import { verify } from "hono/jwt";
-
-const totp: Number[] = [];
+import { checkOtpCache, client, storeOtp, verifyOtp } from "@/utils/redis";
 
 export const register = async (c: Context) => {
     try {
@@ -41,8 +40,9 @@ export const register = async (c: Context) => {
             .values({ username, email, password: hashedPassword })
             .returning({ insertedId: usersTable.id });
 
-        const thisotp = await sendOtp(email);
-        totp.push(thisotp);
+        const otp = await sendOtp(email);
+
+        storeOtp(otp, userId.insertedId);
 
         await generateAuthToken(userId.insertedId, c);
 
@@ -60,35 +60,53 @@ export const register = async (c: Context) => {
 };
 
 export const verifyEmail = async (c: Context) => {
-    const sessionToken = getCookie(c, "session_token");
+    try {
+        const sessionToken = getCookie(c, "session_token");
 
-    if (!sessionToken) {
-        return c.json({ message: "Unauthorized: Missing session token" }, 401);
+        if (!sessionToken) {
+            return c.json(
+                { message: "Unauthorized: Missing session token" },
+                401,
+            );
+        }
+
+        const secret = process.env.JWT_SECRET! || "development";
+
+        const { sub } = await verify(sessionToken, secret, "HS512");
+
+        const [user] = await db
+            .select()
+            .from(usersTable)
+            .where(eq(usersTable.id, Number(sub)));
+
+        const isCached = checkOtpCache(user.id);
+        if (!isCached) {
+            const otp = await sendOtp(user.email);
+            storeOtp(otp, user.id);
+        }
+
+        const { otp } = await c.req.json();
+        if (!otp) {
+            return c.json({ message: "Invalid Otp. Please try again" }, 403);
+        }
+
+        const verified = await verifyOtp(Number(otp), user.id);
+        if (verified !== true) {
+            return c.json({ message: "Invalid Otp" }, 403);
+        }
+
+        client.del(`otp:${user.id}`);
+
+        await db
+            .update(usersTable)
+            .set({ isVerified: true })
+            .where(eq(usersTable.id, user.id));
+
+        return c.json({ message: "Email verified" }, 200);
+    } catch (err) {
+        console.log(err);
+        return c.json({ message: "Internal server error" }, 500);
     }
-
-    const secret = process.env.JWT_SECRET! || "development";
-
-    const { sub } = await verify(sessionToken, secret, "HS512");
-
-    const [user] = await db
-        .select()
-        .from(usersTable)
-        .where(eq(usersTable.id, Number(sub)));
-
-    const savedOtp = totp[0];
-
-    const { otp } = await c.req.json();
-
-    if (otp !== savedOtp) {
-        return c.json({ message: "Invalid OTP" }, 400);
-    }
-
-    await db
-        .update(usersTable)
-        .set({ isVerified: true })
-        .where(eq(usersTable.id, user.id));
-
-    return c.json({ message: "Email verified" }, 200);
 };
 
 export const login = async (c: Context) => {
